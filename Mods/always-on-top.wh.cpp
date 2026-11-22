@@ -7,7 +7,7 @@
 // @github          https://github.com/AhmedAwad7
 // @license         MIT
 // @include         windhawk.exe
-// @compilerOptions -luser32 -lwinmm -lgdi32 -ldwmapi -lshell32 -lole32
+// @compilerOptions -luser32 -lwinmm -lgdi32 -ldwmapi -lshell32 -lole32 -lcomctl32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -26,6 +26,15 @@ This mod helps you multitask by pinning important windows so they always remain 
 - `Ctrl+Alt+D` Decrease transparent window
 > ⚠️Important Note on AltGr:
 > - Windows reports `AltGr` as `Ctrl+Alt`. On some keyboard layout (e.g., US-International, German, French), these shortcuts might block typing specific characters (like `AltGr+T` typing `þ`) You can change the hotkeys in the mod settings if you encounter this.
+
+## Experimental title-bar button
+
+Enable "Show experimental title bar pin button" to add a mouse button to
+supported classic title bars. Hover for the current action. It is hidden on
+maximized windows and whenever placement cannot be verified. Modern Notepad,
+File Explorer, tabbed and custom title bars are not supported. Use the shortcut
+or the optional title-bar context-menu entry for those windows and for keyboard
+access. The button is not a keyboard-focusable or screen-reader button.
 
 ## Features:
 - 🔊 Audio notifications to indicate pinning/unpinning, with the ability to customize or disable them.
@@ -362,7 +371,7 @@ This mod helps you multitask by pinning important windows so they always remain 
   $description:ar-SA: التطبيقات التي لا يمكن تثبيتها أبدا، مفصولة بفواصل منقوطة، مثل Notepad.exe; Calc.exe. يتطابق الاسم الجزئي أيضا، لذا يقوم المفكرة بحظر Notepad.exe و Notepad++.exe.
 - titleBarPinButton: false
   $name: Show experimental title bar pin button
-  $description: Shows a pin button on supported classic window title bars. Custom title bars may not be supported.
+  $description: Shows a mouse button on a small set of classic title bars when safe placement can be verified. Hidden on maximized windows. Explorer, modern Notepad and custom or tabbed title bars are not supported; use the shortcut or title bar context menu instead.
 - showInSystemMenu: true
   $name: Show Always on Top in the title bar context menu
   $name:ar-SA: إظهار Always on top في قائمة السياق بشريط العنوان 
@@ -373,6 +382,7 @@ This mod helps you multitask by pinning important windows so they always remain 
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
@@ -2510,6 +2520,8 @@ static void ProcessCommand(HWND wnd) {
 // put tabs or other controls beside the caption buttons, so fail closed.
 static HWND g_pinButton = nullptr;
 static HWND g_pinButtonTarget = nullptr;
+static HWND g_pinButtonTooltip = nullptr;
+static bool g_pinButtonHover = false;
 static HWND g_pinButtonPressedTarget = nullptr;
 static RECT g_pinButtonPressedRect = {};
 static std::vector<HWINEVENTHOOK> g_pinButtonHooks;
@@ -2619,10 +2631,24 @@ static void UpdatePinButton() {
         g_pinButtonTarget = nullptr;
         g_pinButtonPressedTarget = nullptr;
         if (GetCapture() == g_pinButton) ReleaseCapture();
+        if (g_pinButtonTooltip) SendMessageW(g_pinButtonTooltip, TTM_POP, 0, 0);
+        g_pinButtonHover = false;
         ShowWindow(g_pinButton, SW_HIDE);
         return;
     }
     g_pinButtonTarget = target;
+    const wchar_t* action = IsTopmost(target) ? L"Unpin from always on top"
+                                              : L"Pin always on top";
+    SetWindowTextW(g_pinButton, action);
+    if (g_pinButtonTooltip) {
+        TOOLINFOW tool = {};
+        tool.cbSize = sizeof(tool);
+        tool.uFlags = TTF_IDISHWND;
+        tool.hwnd = g_pinButton;
+        tool.uId = (UINT_PTR)g_pinButton;
+        tool.lpszText = const_cast<wchar_t*>(action);
+        SendMessageW(g_pinButtonTooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&tool);
+    }
     SetWindowPos(g_pinButton, HWND_TOPMOST, rect.left, rect.top,
                  rect.right - rect.left, rect.bottom - rect.top,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -2633,12 +2659,25 @@ static LRESULT CALLBACK PinButtonWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM l
     switch (msg) {
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
+        case WM_MOUSEMOVE:
+            if (!g_pinButtonHover) {
+                g_pinButtonHover = true;
+                TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, wnd, 0};
+                TrackMouseEvent(&track);
+                InvalidateRect(wnd, nullptr, TRUE);
+            }
+            return 0;
+        case WM_MOUSELEAVE:
+            g_pinButtonHover = false;
+            InvalidateRect(wnd, nullptr, TRUE);
+            return 0;
         case WM_LBUTTONDOWN:
             g_pinButtonPressedTarget = g_pinButtonTarget;
             if (g_pinButtonPressedTarget && GetWindowRect(wnd, &g_pinButtonPressedRect))
                 SetCapture(wnd);
             else
                 g_pinButtonPressedTarget = nullptr;
+            InvalidateRect(wnd, nullptr, TRUE);
             return 0;
         case WM_LBUTTONUP: {
             HWND target = g_pinButtonPressedTarget;
@@ -2665,6 +2704,7 @@ static LRESULT CALLBACK PinButtonWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM l
         case WM_CANCELMODE:
             g_pinButtonPressedTarget = nullptr;
             if (GetCapture() == wnd) ReleaseCapture();
+            InvalidateRect(wnd, nullptr, TRUE);
             return 0;
         case WM_PAINT: {
             PAINTSTRUCT ps = {};
@@ -2673,10 +2713,13 @@ static LRESULT CALLBACK PinButtonWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM l
             GetClientRect(wnd, &r);
             bool pinned = g_pinButtonTarget && IsWindow(g_pinButtonTarget) &&
                           IsTopmost(g_pinButtonTarget);
-            HBRUSH bg = CreateSolidBrush(GetSysColor(COLOR_ACTIVECAPTION));
+            bool pressed = g_pinButtonPressedTarget && GetCapture() == wnd;
+            int background = (pressed || g_pinButtonHover) ? COLOR_HIGHLIGHT : COLOR_ACTIVECAPTION;
+            HBRUSH bg = CreateSolidBrush(GetSysColor(background));
             if (bg) { FillRect(dc, &r, bg); DeleteObject(bg); }
             // A compact pushpin glyph. The feature is experimental.
-            COLORREF color = pinned ? RGB(0, 120, 215) : GetSysColor(COLOR_CAPTIONTEXT);
+            COLORREF color = GetSysColor((pressed || g_pinButtonHover)
+                                            ? COLOR_HIGHLIGHTTEXT : COLOR_CAPTIONTEXT);
             int h = r.bottom - r.top, x = (r.right - r.left) / 2, y = h / 2;
             int size = std::max(3, h / 5);
             HPEN pen = CreatePen(PS_SOLID, std::max(1, h / 16), color);
@@ -2687,6 +2730,10 @@ static LRESULT CALLBACK PinButtonWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM l
                 MoveToEx(dc, x + size / 2, y - size, nullptr); LineTo(dc, x + size / 2, y);
                 MoveToEx(dc, x - size, y, nullptr); LineTo(dc, x + size + 1, y);
                 MoveToEx(dc, x, y, nullptr); LineTo(dc, x, y + size + 2);
+                if (pinned) {
+                    MoveToEx(dc, x - size, y + size, nullptr);
+                    LineTo(dc, x + size + 1, y + size);
+                }
                 SelectObject(dc, old); DeleteObject(pen);
             }
             EndPaint(wnd, &ps);
@@ -2733,6 +2780,9 @@ static void SetPinButtonEnabled(bool enabled) {
         g_pinButtonUpdateQueued = false;
         g_pinButtonMenuDepth = 0;
         g_pinButtonMoving = false;
+        if (g_pinButtonTooltip) DestroyWindow(g_pinButtonTooltip);
+        g_pinButtonTooltip = nullptr;
+        g_pinButtonHover = false;
         if (g_pinButton) DestroyWindow(g_pinButton);
         g_pinButton = nullptr;
         UnregisterClassW(kPinButtonClassName, nullptr);
@@ -2755,6 +2805,28 @@ static void SetPinButtonEnabled(bool enabled) {
         UnregisterClassW(kPinButtonClassName, nullptr);
         Wh_Log(L"[aot-plus] could not create pin button");
         return;
+    }
+    // Tooltip supplies a textual, state-sensitive hint without activating the
+    // target. If common controls are unavailable, the button still works.
+    INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_WIN95_CLASSES};
+    if (InitCommonControlsEx(&controls)) {
+        g_pinButtonTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                             WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                             CW_USEDEFAULT, g_pinButton, nullptr,
+                                             GetModuleHandleW(nullptr), nullptr);
+        if (g_pinButtonTooltip) {
+            TOOLINFOW tool = {};
+            tool.cbSize = sizeof(tool);
+            tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            tool.hwnd = g_pinButton;
+            tool.uId = (UINT_PTR)g_pinButton;
+            tool.lpszText = const_cast<wchar_t*>(L"Pin always on top");
+            if (!SendMessageW(g_pinButtonTooltip, TTM_ADDTOOLW, 0, (LPARAM)&tool)) {
+                DestroyWindow(g_pinButtonTooltip);
+                g_pinButtonTooltip = nullptr;
+            }
+        }
     }
     const DWORD events[] = {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZESTART,
                             EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MENUPOPUPSTART,
