@@ -360,6 +360,9 @@ This mod helps you multitask by pinning important windows so they always remain 
   $name:ar-SA: التطبيقات المستبعدة 
   $description: Apps that can never be pinned, separated by semicolons, for example Notepad.exe;Calc.exe. A partial name matches too, so Notepad blocks Notepad.exe and Notepad++.exe.
   $description:ar-SA: التطبيقات التي لا يمكن تثبيتها أبدا، مفصولة بفواصل منقوطة، مثل Notepad.exe; Calc.exe. يتطابق الاسم الجزئي أيضا، لذا يقوم المفكرة بحظر Notepad.exe و Notepad++.exe.
+- titleBarPinButton: false
+  $name: Show experimental title bar pin button
+  $description: Shows a pin button on supported classic window title bars. Custom title bars may not be supported.
 - showInSystemMenu: true
   $name: Show Always on Top in the title bar context menu
   $name:ar-SA: إظهار Always on top في قائمة السياق بشريط العنوان 
@@ -369,6 +372,7 @@ This mod helps you multitask by pinning important windows so they always remain 
 // ==/WindhawkModSettings==
 
 #include <windows.h>
+#include <windowsx.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
@@ -383,6 +387,7 @@ This mod helps you multitask by pinning important windows so they always remain 
 
 // Non-ASCII literals avoided on purpose; keep this file pure ASCII.
 
+static const WCHAR kPinButtonClassName[] = L"AotPlusPinButtonClass";
 static const WCHAR kHostClassName[] = L"AotPlusHostClass";
 static const WCHAR kBorderClassName[] = L"AotPlusBorderClass";
 static const WCHAR kNotifyClassName[] = L"AotPlusNotifyClass";
@@ -398,6 +403,7 @@ static const UINT kMaintainTimerId = 125;
 static const UINT WM_APP_QUIT = WM_APP + 1;
 static const UINT WM_APP_SETTINGS = WM_APP + 2;
 static const UINT WM_APP_REBORDER = WM_APP + 3;
+static const UINT WM_APP_PIN_BUTTON_UPDATE = WM_APP + 4;
 static const UINT WM_HOOK_SET = WM_APP + 20;
 
 // Older SDK headers lack the cloak events.
@@ -443,6 +449,7 @@ struct Settings {
     bool gameModeBlock = true;
     std::vector<std::wstring> excludedApps;
     bool showInSystemMenu = false;
+    bool titleBarPinButton = false;
 };
 
 static CRITICAL_SECTION g_cs;
@@ -1025,6 +1032,7 @@ static void LoadSettingsLocked() {
     Wh_FreeStringSetting(apps);
 
     g_settings.showInSystemMenu = Wh_GetIntSetting(L"showInSystemMenu") != 0;
+    g_settings.titleBarPinButton = Wh_GetIntSetting(L"titleBarPinButton") != 0;
 }
 
 static void LoadSettings() {
@@ -2308,6 +2316,8 @@ static void PruneMenuWindows() {
     }
 }
 
+static void UpdatePinButton();
+
 // ----- Toggle -----
 
 static bool HasPendingCheck(HWND wnd) {
@@ -2492,6 +2502,240 @@ static void ProcessCommandImpl(HWND wnd) {
 static void ProcessCommand(HWND wnd) {
     ProcessCommandImpl(wnd);
     UpdateBorderHooks(); // a window was pinned or unpinned
+    UpdatePinButton();
+}
+
+// ----- Experimental title-bar pin button -----
+// These windows are known to have classic caption layouts. Other apps may
+// put tabs or other controls beside the caption buttons, so fail closed.
+static HWND g_pinButton = nullptr;
+static HWND g_pinButtonTarget = nullptr;
+static HWND g_pinButtonPressedTarget = nullptr;
+static RECT g_pinButtonPressedRect = {};
+static std::vector<HWINEVENTHOOK> g_pinButtonHooks;
+static bool g_pinButtonUpdateQueued = false;
+static unsigned int g_pinButtonMenuDepth = 0;
+
+static bool PinButtonEligible(HWND wnd, RECT* buttonRect) {
+    if (!wnd || !IsWindow(wnd) || !IsWindowVisible(wnd) || IsIconic(wnd) ||
+        IsZoomed(wnd) || IsOwnWindow(wnd) || IsSystemSurface(wnd) ||
+        IsWindowCloaked(wnd) || IsExcludedWindow(wnd)) {
+        return false;
+    }
+    LONG_PTR style = GetWindowLongPtrW(wnd, GWL_STYLE);
+    if ((style & WS_CAPTION) != WS_CAPTION || !(style & WS_SYSMENU)) {
+        return false;
+    }
+    WCHAR cls[128] = {};
+    if (!GetClassNameW(wnd, cls, ARRAYSIZE(cls))) return false;
+    // The Notepad class alone does not establish a classic caption on
+    // current Windows versions; its tab strip may occupy this space.
+    // Do not overlay unknown custom title-bar controls.
+    if (wcscmp(cls, L"SciCalc") != 0) return false;
+    RECT win = {}, buttons = {};
+    if (!GetWindowRect(wnd, &win) ||
+        FAILED(DwmGetWindowAttribute(wnd, DWMWA_CAPTION_BUTTON_BOUNDS,
+                                     &buttons, sizeof(buttons))) ||
+        buttons.right <= buttons.left || buttons.bottom <= buttons.top) {
+        return false;
+    }
+    // Measure the complete caption with the system caption font at the target
+    // DPI. If text or metrics cannot be obtained reliably, fail closed.
+    WCHAR title[512] = {};
+    int titleLength = GetWindowTextLengthW(wnd);
+    if (titleLength < 0 || titleLength >= (int)ARRAYSIZE(title) - 1 ||
+        (titleLength && !GetWindowTextW(wnd, title, ARRAYSIZE(title)))) return false;
+    NONCLIENTMETRICSW metrics = {};
+    metrics.cbSize = sizeof(metrics);
+    if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
+        return false;
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    int systemDpi = GetDeviceCaps(dc, LOGPIXELSY);
+    if (systemDpi <= 0) { ReleaseDC(nullptr, dc); return false; }
+    metrics.lfCaptionFont.lfHeight = MulDiv(metrics.lfCaptionFont.lfHeight,
+                                            GetWindowDpi(wnd), systemDpi);
+    HFONT font = CreateFontIndirectW(&metrics.lfCaptionFont);
+    if (!font) { ReleaseDC(nullptr, dc); return false; }
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SIZE textSize = {};
+    bool measured = oldFont && GetTextExtentPoint32W(dc, title, titleLength, &textSize);
+    if (oldFont) SelectObject(dc, oldFont);
+    DeleteObject(font);
+    ReleaseDC(nullptr, dc);
+    if (!measured) return false;
+    int reserve = textSize.cx + MulDiv(64, GetWindowDpi(wnd), 96);
+    int height = buttons.bottom - buttons.top;
+    int width = height; // use the actual caption height, scaled by the window
+    if (height < 12 || height > 100 || buttons.left < width + reserve ||
+        buttons.right > win.right - win.left || buttons.top < 0) return false;
+    buttonRect->left = win.left + buttons.left - width;
+    buttonRect->top = win.top + buttons.top;
+    buttonRect->right = buttonRect->left + width;
+    buttonRect->bottom = buttonRect->top + height;
+    return true;
+}
+
+static void UpdatePinButton() {
+    if (!g_pinButton) return;
+    HWND target = GetForegroundWindow();
+    RECT rect = {};
+    Settings settings = GetSettingsCopy();
+    if (!settings.titleBarPinButton || g_pinButtonMenuDepth != 0 ||
+        (settings.gameModeBlock && GameModeActive()) ||
+        !PinButtonEligible(target, &rect)) {
+        g_pinButtonTarget = nullptr;
+        g_pinButtonPressedTarget = nullptr;
+        if (GetCapture() == g_pinButton) ReleaseCapture();
+        ShowWindow(g_pinButton, SW_HIDE);
+        return;
+    }
+    g_pinButtonTarget = target;
+    SetWindowPos(g_pinButton, HWND_TOPMOST, rect.left, rect.top,
+                 rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_pinButton, nullptr, TRUE);
+}
+
+static LRESULT CALLBACK PinButtonWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_LBUTTONDOWN:
+            g_pinButtonPressedTarget = g_pinButtonTarget;
+            if (g_pinButtonPressedTarget && GetWindowRect(wnd, &g_pinButtonPressedRect))
+                SetCapture(wnd);
+            else
+                g_pinButtonPressedTarget = nullptr;
+            return 0;
+        case WM_LBUTTONUP: {
+            HWND target = g_pinButtonPressedTarget;
+            g_pinButtonPressedTarget = nullptr;
+            bool captured = GetCapture() == wnd;
+            if (captured) ReleaseCapture();
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            RECT client = {}, current = {};
+            GetClientRect(wnd, &client);
+            // Validate the press, release, foreground and geometry again. A
+            // moved/hidden target must never turn a stale click into a toggle.
+            if (captured && PtInRect(&client, pt) && target &&
+                target == g_pinButtonTarget && target == GetForegroundWindow() &&
+                PinButtonEligible(target, &current)) {
+                RECT overlay = {};
+                if (GetWindowRect(wnd, &overlay) && EqualRect(&current, &overlay) &&
+                    EqualRect(&overlay, &g_pinButtonPressedRect))
+                    ProcessCommand(target);
+            }
+            UpdatePinButton();
+            return 0;
+        }
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            g_pinButtonPressedTarget = nullptr;
+            if (GetCapture() == wnd) ReleaseCapture();
+            return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT ps = {};
+            HDC dc = BeginPaint(wnd, &ps);
+            RECT r = {};
+            GetClientRect(wnd, &r);
+            bool pinned = g_pinButtonTarget && IsWindow(g_pinButtonTarget) &&
+                          IsTopmost(g_pinButtonTarget);
+            HBRUSH bg = CreateSolidBrush(GetSysColor(COLOR_ACTIVECAPTION));
+            if (bg) { FillRect(dc, &r, bg); DeleteObject(bg); }
+            // A compact pushpin glyph. The feature is experimental.
+            COLORREF color = pinned ? RGB(0, 120, 215) : GetSysColor(COLOR_CAPTIONTEXT);
+            int h = r.bottom - r.top, x = (r.right - r.left) / 2, y = h / 2;
+            int size = std::max(3, h / 5);
+            HPEN pen = CreatePen(PS_SOLID, std::max(1, h / 16), color);
+            if (pen) {
+                HGDIOBJ old = SelectObject(dc, pen);
+                MoveToEx(dc, x - size, y - size, nullptr); LineTo(dc, x + size, y - size);
+                MoveToEx(dc, x - size / 2, y - size, nullptr); LineTo(dc, x - size / 2, y);
+                MoveToEx(dc, x + size / 2, y - size, nullptr); LineTo(dc, x + size / 2, y);
+                MoveToEx(dc, x - size, y, nullptr); LineTo(dc, x + size + 1, y);
+                MoveToEx(dc, x, y, nullptr); LineTo(dc, x, y + size + 2);
+                SelectObject(dc, old); DeleteObject(pen);
+            }
+            EndPaint(wnd, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProcW(wnd, msg, wp, lp);
+}
+
+static void CALLBACK PinButtonEventProc(HWINEVENTHOOK, DWORD event, HWND wnd, LONG object,
+                                        LONG child, DWORD, DWORD) {
+    if (!g_hostWnd) return;
+    if (event == EVENT_SYSTEM_MENUPOPUPSTART) {
+        if (g_pinButtonMenuDepth < 64) ++g_pinButtonMenuDepth;
+    } else if (event == EVENT_SYSTEM_MENUPOPUPEND) {
+        if (g_pinButtonMenuDepth) --g_pinButtonMenuDepth;
+    } else if (!wnd || object != OBJID_WINDOW || child != CHILDID_SELF ||
+               (event != EVENT_SYSTEM_FOREGROUND && wnd != g_pinButtonTarget)) {
+        return;
+    } else if (event == EVENT_SYSTEM_FOREGROUND) {
+        // A foreground change abandons any stale unmatched menu events.
+        g_pinButtonMenuDepth = 0;
+    }
+    // Hooks and host window run on the same thread; one pending update suffices.
+    if (!g_pinButtonUpdateQueued) {
+        g_pinButtonUpdateQueued = true;
+        if (!PostMessageW(g_hostWnd, WM_APP_PIN_BUTTON_UPDATE, 0, 0))
+            g_pinButtonUpdateQueued = false;
+    }
+}
+
+static void SetPinButtonEnabled(bool enabled) {
+    if (!enabled) {
+        for (HWINEVENTHOOK hook : g_pinButtonHooks) UnhookWinEvent(hook);
+        g_pinButtonHooks.clear();
+        g_pinButtonTarget = nullptr;
+        g_pinButtonPressedTarget = nullptr;
+        if (GetCapture() == g_pinButton) ReleaseCapture();
+        g_pinButtonUpdateQueued = false;
+        g_pinButtonMenuDepth = 0;
+        if (g_pinButton) DestroyWindow(g_pinButton);
+        g_pinButton = nullptr;
+        UnregisterClassW(kPinButtonClassName, nullptr);
+        return;
+    }
+    if (g_pinButton) { UpdatePinButton(); return; }
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = PinButtonWndProc;
+    wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
+    wc.lpszClassName = kPinButtonClassName;
+    if (!RegisterClassExW(&wc)) {
+        Wh_Log(L"[aot-plus] could not register pin button class");
+        return;
+    }
+    g_pinButton = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                                  kPinButtonClassName, L"Toggle always on top", WS_POPUP,
+                                  0, 0, 1, 1, nullptr, nullptr, nullptr, nullptr);
+    if (!g_pinButton) {
+        UnregisterClassW(kPinButtonClassName, nullptr);
+        Wh_Log(L"[aot-plus] could not create pin button");
+        return;
+    }
+    const DWORD events[] = {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPSTART,
+                            EVENT_SYSTEM_MENUPOPUPEND, EVENT_OBJECT_LOCATIONCHANGE,
+                            EVENT_OBJECT_NAMECHANGE,
+                            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+                            EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+                            EVENT_OBJECT_CLOAKED_AOT, EVENT_OBJECT_UNCLOAKED_AOT};
+    for (DWORD event : events) {
+        HWINEVENTHOOK hook = SetWinEventHook(event, event, nullptr, PinButtonEventProc,
+                                             0, 0, WINEVENT_OUTOFCONTEXT |
+                                             WINEVENT_SKIPOWNPROCESS);
+        if (!hook) {
+            Wh_Log(L"[aot-plus] failed to register pin button event hook %lu", event);
+            SetPinButtonEnabled(false);
+            return;
+        }
+        g_pinButtonHooks.push_back(hook);
+    }
+    UpdatePinButton();
 }
 
 // ----- Win events -----
@@ -2863,6 +3107,10 @@ static void RegisterOurHotkeys(HWND host) {
 
 static LRESULT CALLBACK HostWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_APP_PIN_BUTTON_UPDATE:
+            g_pinButtonUpdateQueued = false;
+            UpdatePinButton();
+            return 0;
         case WM_HOTKEY: {
             HWND fg = GetForegroundWindow();
             if (!fg) {
@@ -2870,6 +3118,7 @@ static LRESULT CALLBACK HostWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == kHotkeyIdPin) {
                 ProcessCommand(fg);
+                UpdatePinButton();
             } else if (wp == kHotkeyIdOpacityUp) {
                 StepWindowTransparency(fg, kOpacityStepPercent);
             } else if (wp == kHotkeyIdOpacityDown) {
@@ -2880,8 +3129,10 @@ static LRESULT CALLBACK HostWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == kVerifyTimerId) {
                 RunPendingChecks();
+                UpdatePinButton();
             } else if (wp == kMaintainTimerId) {
                 MaintainPinned();
+                if (g_pinButton) UpdatePinButton();
             }
             return 0;
         case WM_APP_REBORDER: {
@@ -2922,6 +3173,7 @@ static LRESULT CALLBACK HostWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RemoveSystemMenuItems();
             }
             UpdateMenuHooks(s.showInSystemMenu);
+            SetPinButtonEnabled(s.titleBarPinButton);
             g_lastSysMenuWnd = nullptr;
             UpdateSystemMenuItem(GetForegroundWindow());
             return 0;
@@ -2980,6 +3232,7 @@ static DWORD WINAPI MainThread(LPVOID) {
     {
         Settings s = GetSettingsCopy();
         UpdateMenuHooks(s.showInSystemMenu);
+        SetPinButtonEnabled(s.titleBarPinButton);
     }
     AdoptPinnedWindows();
     UpdateBorderHooks();
@@ -3001,6 +3254,7 @@ static DWORD WINAPI MainThread(LPVOID) {
     UnregisterHotKey(g_hostWnd, kHotkeyIdOpacityUp);
     UnregisterHotKey(g_hostWnd, kHotkeyIdOpacityDown);
     StopHookThread();
+    SetPinButtonEnabled(false);
     KillTimer(g_hostWnd, kMaintainTimerId);
     KillTimer(g_hostWnd, kVerifyTimerId);
     g_pendingChecks.clear();
