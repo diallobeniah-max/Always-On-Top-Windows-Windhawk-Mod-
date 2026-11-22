@@ -31,8 +31,9 @@ This mod helps you multitask by pinning important windows so they always remain 
 
 Enable "Show experimental title bar pin button" to add a mouse button to
 supported classic title bars. Hover for the current action. It is hidden on
-maximized windows and whenever placement cannot be verified. Modern Notepad,
-File Explorer, tabbed and custom title bars are not supported. Use the shortcut
+maximized windows and whenever placement cannot be verified. File Explorer can
+be enabled separately, but the button may cover tabs or other controls. Modern
+Notepad and other tabbed or custom title bars are not supported. Use the shortcut
 or the optional title-bar context-menu entry for those windows and for keyboard
 access. The button is not a keyboard-focusable or screen-reader button.
 
@@ -371,7 +372,13 @@ access. The button is not a keyboard-focusable or screen-reader button.
   $description:ar-SA: التطبيقات التي لا يمكن تثبيتها أبدا، مفصولة بفواصل منقوطة، مثل Notepad.exe; Calc.exe. يتطابق الاسم الجزئي أيضا، لذا يقوم المفكرة بحظر Notepad.exe و Notepad++.exe.
 - titleBarPinButton: false
   $name: Show experimental title bar pin button
-  $description: Shows a mouse button on a small set of classic title bars when safe placement can be verified. Hidden on maximized windows. Explorer, modern Notepad and custom or tabbed title bars are not supported; use the shortcut or title bar context menu instead.
+  $description: Shows a mouse button on a small set of classic title bars when safe placement can be verified. Hidden on maximized windows. File Explorer can be enabled separately below. Modern Notepad and other custom or tabbed title bars are not supported; use the shortcut or title bar context menu instead.
+- explorerPinButton: false
+  $name: Also show the button on File Explorer
+  $description: Requires the title bar pin button above. Explorer tabs and controls can be covered by this overlay, including as tabs change; turn this off if it interferes. Hidden on maximized windows.
+- explorerPinOffset: 0
+  $name: File Explorer button offset to the left
+  $description: Extra distance in 96-DPI pixels from the standard caption buttons. Use 0 to place the button directly beside minimize. Range 0 to 500. This cannot guarantee an empty area.
 - showInSystemMenu: true
   $name: Show Always on Top in the title bar context menu
   $name:ar-SA: إظهار Always on top في قائمة السياق بشريط العنوان 
@@ -460,6 +467,8 @@ struct Settings {
     std::vector<std::wstring> excludedApps;
     bool showInSystemMenu = false;
     bool titleBarPinButton = false;
+    bool explorerPinButton = false;
+    int explorerPinOffset = 0;
 };
 
 static CRITICAL_SECTION g_cs;
@@ -1043,6 +1052,8 @@ static void LoadSettingsLocked() {
 
     g_settings.showInSystemMenu = Wh_GetIntSetting(L"showInSystemMenu") != 0;
     g_settings.titleBarPinButton = Wh_GetIntSetting(L"titleBarPinButton") != 0;
+    g_settings.explorerPinButton = Wh_GetIntSetting(L"explorerPinButton") != 0;
+    g_settings.explorerPinOffset = std::clamp(Wh_GetIntSetting(L"explorerPinOffset"), 0, 500);
 }
 
 static void LoadSettings() {
@@ -2544,7 +2555,17 @@ static bool PinButtonEligible(HWND wnd, RECT* buttonRect) {
     // The Notepad class alone does not establish a classic caption on
     // current Windows versions; its tab strip may occupy this space.
     // Do not overlay unknown custom title-bar controls.
-    if (wcscmp(cls, L"SciCalc") != 0) {
+    bool explorer = wcscmp(cls, L"CabinetWClass") == 0;
+    Settings settings = GetSettingsCopy();
+    if (explorer && !settings.explorerPinButton) return false;
+    if (explorer) {
+        WCHAR windowsDir[MAX_PATH] = {};
+        UINT n = GetWindowsDirectoryW(windowsDir, ARRAYSIZE(windowsDir));
+        if (!n || n >= ARRAYSIZE(windowsDir)) return false;
+        std::wstring expected = std::wstring(windowsDir) + L"\\explorer.exe";
+        if (_wcsicmp(GetWindowProcessPath(wnd).c_str(), expected.c_str()) != 0)
+            return false;
+    } else if (wcscmp(cls, L"SciCalc") != 0) {
         // Only known standard-caption Windows utilities are considered here.
         // In particular, Explorer and modern Notepad can put tabs in this area.
         const wchar_t* exe = nullptr;
@@ -2566,6 +2587,21 @@ static bool PinButtonEligible(HWND wnd, RECT* buttonRect) {
                                      &buttons, sizeof(buttons))) ||
         buttons.right <= buttons.left || buttons.bottom <= buttons.top) {
         return false;
+    }
+    if (explorer) {
+        // Explorer uses a dynamic tab strip; DWM bounds only locate the system
+        // buttons, not free space. This overlay is explicitly opt-in and can
+        // cover Explorer controls. Never infer emptiness from WM_NCHITTEST.
+        int height = buttons.bottom - buttons.top;
+        int offset = MulDiv(settings.explorerPinOffset, GetWindowDpi(wnd), 96);
+        if (height < 12 || height > 100 || offset < 0 ||
+            buttons.left < height + offset || buttons.right > win.right - win.left ||
+            buttons.top < 0 || buttons.bottom > win.bottom - win.top) return false;
+        buttonRect->right = win.left + buttons.left - offset;
+        buttonRect->left = buttonRect->right - height;
+        buttonRect->top = win.top + buttons.top;
+        buttonRect->bottom = win.top + buttons.bottom;
+        return true;
     }
     // Measure the complete caption with the system caption font at the target
     // DPI. If text or metrics cannot be obtained reliably, fail closed.
