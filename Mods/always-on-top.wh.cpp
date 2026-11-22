@@ -2515,6 +2515,7 @@ static RECT g_pinButtonPressedRect = {};
 static std::vector<HWINEVENTHOOK> g_pinButtonHooks;
 static bool g_pinButtonUpdateQueued = false;
 static unsigned int g_pinButtonMenuDepth = 0;
+static bool g_pinButtonMoving = false;
 
 static bool PinButtonEligible(HWND wnd, RECT* buttonRect) {
     if (!wnd || !IsWindow(wnd) || !IsWindowVisible(wnd) || IsIconic(wnd) ||
@@ -2531,7 +2532,22 @@ static bool PinButtonEligible(HWND wnd, RECT* buttonRect) {
     // The Notepad class alone does not establish a classic caption on
     // current Windows versions; its tab strip may occupy this space.
     // Do not overlay unknown custom title-bar controls.
-    if (wcscmp(cls, L"SciCalc") != 0) return false;
+    if (wcscmp(cls, L"SciCalc") != 0) {
+        // Only known standard-caption Windows utilities are considered here.
+        // In particular, Explorer and modern Notepad can put tabs in this area.
+        const wchar_t* exe = nullptr;
+        if (wcscmp(cls, L"ConsoleWindowClass") == 0) exe = L"conhost.exe";
+        else if (wcscmp(cls, L"RegEdit_RegEdit") == 0) exe = L"regedit.exe";
+        if (!exe) return false;
+        WCHAR systemDir[MAX_PATH] = {};
+        UINT n = wcscmp(cls, L"RegEdit_RegEdit") == 0
+                     ? GetWindowsDirectoryW(systemDir, ARRAYSIZE(systemDir))
+                     : GetSystemDirectoryW(systemDir, ARRAYSIZE(systemDir));
+        if (!n || n >= ARRAYSIZE(systemDir)) return false;
+        std::wstring expected = std::wstring(systemDir) + L"\\" + exe;
+        if (_wcsicmp(GetWindowProcessPath(wnd).c_str(), expected.c_str()) != 0)
+            return false;
+    }
     RECT win = {}, buttons = {};
     if (!GetWindowRect(wnd, &win) ||
         FAILED(DwmGetWindowAttribute(wnd, DWMWA_CAPTION_BUTTON_BOUNDS,
@@ -2568,11 +2584,27 @@ static bool PinButtonEligible(HWND wnd, RECT* buttonRect) {
     int height = buttons.bottom - buttons.top;
     int width = height; // use the actual caption height, scaled by the window
     if (height < 12 || height > 100 || buttons.left < width + reserve ||
-        buttons.right > win.right - win.left || buttons.top < 0) return false;
+        buttons.right > win.right - win.left || buttons.top < 0 ||
+        buttons.bottom > win.bottom - win.top) return false;
     buttonRect->left = win.left + buttons.left - width;
     buttonRect->top = win.top + buttons.top;
     buttonRect->right = buttonRect->left + width;
     buttonRect->bottom = buttonRect->top + height;
+    // Check the middle of the proposed area for caption controls. The top
+    // edge can legitimately be a resize grip, even on a classic caption.
+    // These checks supplement the allowlist; they do not establish that an
+    // unknown or custom title bar is safe to cover.
+    const int inset = std::max(1, height / 4);
+    const int midY = (buttonRect->top + buttonRect->bottom) / 2;
+    POINT points[] = {{buttonRect->left + inset, midY},
+                      {(buttonRect->left + buttonRect->right) / 2, midY},
+                      {buttonRect->right - inset - 1, midY}};
+    for (const POINT& pt : points) {
+        DWORD_PTR hit = 0;
+        if (!SendMessageTimeoutW(wnd, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y),
+                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, &hit) ||
+            (LRESULT)hit != HTCAPTION) return false;
+    }
     return true;
 }
 
@@ -2581,7 +2613,7 @@ static void UpdatePinButton() {
     HWND target = GetForegroundWindow();
     RECT rect = {};
     Settings settings = GetSettingsCopy();
-    if (!settings.titleBarPinButton || g_pinButtonMenuDepth != 0 ||
+    if (!settings.titleBarPinButton || g_pinButtonMenuDepth != 0 || g_pinButtonMoving ||
         (settings.gameModeBlock && GameModeActive()) ||
         !PinButtonEligible(target, &rect)) {
         g_pinButtonTarget = nullptr;
@@ -2667,7 +2699,11 @@ static LRESULT CALLBACK PinButtonWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM l
 static void CALLBACK PinButtonEventProc(HWINEVENTHOOK, DWORD event, HWND wnd, LONG object,
                                         LONG child, DWORD, DWORD) {
     if (!g_hostWnd) return;
-    if (event == EVENT_SYSTEM_MENUPOPUPSTART) {
+    if (event == EVENT_SYSTEM_MOVESIZESTART && wnd == g_pinButtonTarget) {
+        g_pinButtonMoving = true;
+    } else if (event == EVENT_SYSTEM_MOVESIZEEND) {
+        g_pinButtonMoving = false;
+    } else if (event == EVENT_SYSTEM_MENUPOPUPSTART) {
         if (g_pinButtonMenuDepth < 64) ++g_pinButtonMenuDepth;
     } else if (event == EVENT_SYSTEM_MENUPOPUPEND) {
         if (g_pinButtonMenuDepth) --g_pinButtonMenuDepth;
@@ -2677,6 +2713,7 @@ static void CALLBACK PinButtonEventProc(HWINEVENTHOOK, DWORD event, HWND wnd, LO
     } else if (event == EVENT_SYSTEM_FOREGROUND) {
         // A foreground change abandons any stale unmatched menu events.
         g_pinButtonMenuDepth = 0;
+        g_pinButtonMoving = false;
     }
     // Hooks and host window run on the same thread; one pending update suffices.
     if (!g_pinButtonUpdateQueued) {
@@ -2695,6 +2732,7 @@ static void SetPinButtonEnabled(bool enabled) {
         if (GetCapture() == g_pinButton) ReleaseCapture();
         g_pinButtonUpdateQueued = false;
         g_pinButtonMenuDepth = 0;
+        g_pinButtonMoving = false;
         if (g_pinButton) DestroyWindow(g_pinButton);
         g_pinButton = nullptr;
         UnregisterClassW(kPinButtonClassName, nullptr);
@@ -2718,7 +2756,8 @@ static void SetPinButtonEnabled(bool enabled) {
         Wh_Log(L"[aot-plus] could not create pin button");
         return;
     }
-    const DWORD events[] = {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPSTART,
+    const DWORD events[] = {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZESTART,
+                            EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MENUPOPUPSTART,
                             EVENT_SYSTEM_MENUPOPUPEND, EVENT_OBJECT_LOCATIONCHANGE,
                             EVENT_OBJECT_NAMECHANGE,
                             EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
@@ -2869,7 +2908,8 @@ static void UpdateMenuHooks(bool enable) {
             return;
         }
         // The foreground event is what puts the entry into each window's menu.
-        const DWORD events[] = {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPSTART,
+        const DWORD events[] = {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZESTART,
+                            EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MENUPOPUPSTART,
                                 EVENT_SYSTEM_MENUPOPUPEND, EVENT_OBJECT_INVOKED};
         for (DWORD ev : events) {
             HWINEVENTHOOK hook = SetWinEventHook(ev, ev, nullptr, WinEventProc, 0, 0,
